@@ -225,7 +225,7 @@ class WieserlabsClient:
             sep = "-"*(maxchars+7)
             debug_msg = f"{sep}\n{debug_msg}{sep}"
             print(debug_msg)
-        # format_msg(msg)
+        format_msg(msg)
 
 
         socket = self.slots[slot_index].socket
@@ -234,7 +234,7 @@ class WieserlabsClient:
 
         msg = data.decode('ascii').strip()
         print(f"Response:")
-        # format_msg(msg)
+        format_msg(msg)
         if "error" in msg.lower():
             # TODO ?
             raise ValueError()
@@ -403,7 +403,7 @@ class WieserlabsClient:
         # The following command is only needed to set the amplitude and phase
         self.single_tone(slot, channel, 0, amp, phase)
 
-        self._set_CFR_bit(slot, channel, 1, 14, 1, send=True) # clear digital ramp accumulator
+        self._clear_ramp_accumulator(slot, channel)
 
         self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
         self._set_CFR_bit(slot, channel, 2, 20, 0) # set ramp to be a frequency ramp
@@ -466,7 +466,7 @@ class WieserlabsClient:
 
         # Here's a list of hacks we have to do to make everything work!
         # The digital ramp generator behaves really annoying.
-        # 1. When ramping up to a frequency, then trying to ramp up again, it won't work.
+        # 1. When ramping up to a phase, then trying to ramp up again, it won't work.
         #    Solution: It works, when we clear the DRCTL pin (by sending update:-d). Then we can do update:+d
 
         norm_pstart = (pstart%360) / 360
@@ -511,6 +511,92 @@ class WieserlabsClient:
         self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
         self._set_CFR_bit(slot, channel, 2, 20, 1) # set ramp to be a phase ramp
         self._set_CFR_bit(slot, channel, 2, 21, 0, send=True) # set ramp to be a phase ramp
+
+        drl_msg = AD9910RegisterWriteMessage(channel, "DRL", DRL)
+        drss_msg = AD9910RegisterWriteMessage(channel, "DRSS", DRSS)
+        drr_msg = AD9910RegisterWriteMessage(channel, "DRR", DRR)
+
+        self.push_message(slot, drl_msg)
+        self.push_message(slot, drss_msg)
+        self.push_message(slot, drr_msg)
+
+        if do_ramp_down:
+            # Yes, we have to separate it.
+            self.push_message(slot, UpdateMessage(channel, f"u"))
+            self.push_message(slot, UpdateMessage(channel, f"-d"))
+        else:
+            self.push_message(slot, UpdateMessage(channel, f"u-d"))
+            self.push_message(slot, UpdateMessage(channel, f"+d"))
+
+    def amplitude_ramp(self, slot, channel, freq, astart, aend,
+        phase, tramp_ns, astep):
+        """
+        Start a phase ramp.
+
+        Parameters
+        ==========
+        `slot`: Which card to talk to.
+        `channel`: Which channel to talk to.
+        `freq`: Frequency during the amplitude ramp.
+        `astart`: Start value of the amplitude ramp.
+        `aend`: Start value of the amplitude ramp.
+        `phase`: Phase during the amplitude ramp.
+        `tramp_ns`: Ramp duration in nanoseconds.
+        `astep`: Step length for amplitude ramp (in general, you probably want this to be small).
+
+        Notes
+        =====
+        The variables `tramp_ns` and `pstep` are both used to calculate the time
+        after which the phase is increased by `pstep`. The formula for this is:
+        $t_step_ns = astep * tramp_ns / |astart - aend|$.
+        The resulting value cannot exceed 0xffff. If it does, we won't do the ramp
+        and instead print an error.
+        """
+
+        # Here's a list of hacks we have to do to make everything work!
+        # The digital ramp generator behaves really annoying.
+        # 1. When ramping up to a amplitude, then trying to ramp up again, it won't work.
+        #    Solution: It works, when we clear the DRCTL pin (by sending update:-d). Then we can do update:+d
+
+        up_ramp_limit = round(max(astart, aend, 0) * 2**32)
+        down_ramp_limit = round(min(astart, aend, 1) * 2**32)
+
+        do_ramp_down = astart > aend
+
+        if do_ramp_down:
+            # https://ez.analog.com/dds/f/q-a/28177/ad9910-amplitude-drg-falling-ramp-starting-at-upper-limit
+            self.amplitude_ramp(slot, channel, freq, 0, astart, phase, 4, astart)
+        else:
+            # Clear accumulator before running the ramp
+            self._clear_ramp_accumulator(slot, channel)
+
+
+        if astart == aend:
+            print("[ERROR]: astart and aend cannot be the same!")
+            return -1
+
+        # We have to give the time after which to increase the amp
+        # by the pstep
+        t_step_ns = astep / abs(astart - aend) * tramp_ns
+        # DDS clock runs at 1/4 * f_SYSCLK, so 250MHz
+        time_in_dds_clock = int(t_step_ns/4)
+
+        if time_in_dds_clock > 0xffff:
+            print("[ERROR]: Either tramp_ns is too big or astep.")
+            return
+
+        amp_step_format = f"{round(astep*2**32):0{8}x}"
+
+        DRL = f"0x{up_ramp_limit:0{8}x}{down_ramp_limit:0{8}x}"
+        DRSS = f"0x{amp_step_format}{amp_step_format}"
+        DRR = f"0x{int(time_in_dds_clock):0{4}x}{int(time_in_dds_clock):0{4}x}"
+
+        # The following command is only needed to set the frequency and amplitude
+        self.single_tone(slot, channel, freq, 0, phase)
+
+        self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
+        self._set_CFR_bit(slot, channel, 2, 20, 0) # set ramp to be a phase ramp
+        self._set_CFR_bit(slot, channel, 2, 21, 1, send=True) # set ramp to be a phase ramp
 
         drl_msg = AD9910RegisterWriteMessage(channel, "DRL", DRL)
         drss_msg = AD9910RegisterWriteMessage(channel, "DRSS", DRSS)
@@ -598,17 +684,37 @@ client = WieserlabsClient("10.0.0.237", max_amp=17.38)
 client.reset(0)
 client.run(0)
 
-client.single_tone(0, 1, 1e6, 0.1, 0)
 client.single_tone(0, 0, 1e6, 0.1, 0)
+client.single_tone(0, 1, 1e6, 0.1, 0)
 client.wait_time(0, 0, 1e9)
+client.wait_time(0, 1, 1e9)
+
+sweep_time = 0.5e9
 
 from random import random
+previous_amp = 0.1
+previous_f = 1e6
 previous_phase = 0
-for i in range(10):
-    random_phase = random() * 360
-    print(f"\t{previous_phase:.2f} -> {random_phase:.2f}")
-    client.phase_ramp(0, 0, 1e6, 0.1, previous_phase, random_phase, 3e9, 1e-5)
-    previous_phase = random_phase
-    client.wait_time(0, 0, 4e9)
+for i in range(30):
+    r = random()
+    if r < 0.33333:
+        random_amp = random() * 0.2
+        print(f"amp -> {random_amp}")
+        client.amplitude_ramp(0, 0, previous_f, previous_amp, random_amp, previous_phase, sweep_time, 1e-8)
+        previous_amp = random_amp
+    elif r < 0.666666:
+        random_f = random()*2e6 + 1e6
+        print(f"f -> {random_f}")
+        client.frequency_ramp(0, 0, previous_f, random_f, previous_amp, previous_phase, sweep_time, 1)
+        client.frequency_ramp(0, 1, previous_f, random_f, 0.1, 0, sweep_time, 1)
+        previous_f = random_f
+    else:
+        random_phase = random() * 360
+        print(f"phase -> {random_phase}")
+        client.phase_ramp(0, 0, previous_f, previous_amp, previous_phase, random_phase, sweep_time, 1e-5)
+        previous_phase = random_phase
+    client.wait_time(0, 0, sweep_time + 1e9)
+    client.wait_time(0, 1, sweep_time + 1e9)
+
 
 client.run(0)
