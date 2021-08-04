@@ -225,7 +225,7 @@ class WieserlabsClient:
             sep = "-"*(maxchars+7)
             debug_msg = f"{sep}\n{debug_msg}{sep}"
             print(debug_msg)
-        format_msg(msg)
+        # format_msg(msg)
 
 
         socket = self.slots[slot_index].socket
@@ -234,7 +234,7 @@ class WieserlabsClient:
 
         msg = data.decode('ascii').strip()
         print(f"Response:")
-        format_msg(msg)
+        # format_msg(msg)
         if "error" in msg.lower():
             # TODO ?
             raise ValueError()
@@ -441,7 +441,7 @@ class WieserlabsClient:
         `slot`: Which card to talk to.
         `channel`: Which channel to talk to.
         `freq`: Frequency during the phase ramp.
-        `amplitude`: Amplitude during the phase ramp.
+        `amp`: Amplitude during the phase ramp.
         `pstart`: Start value of the phase ramp.
         `pend`: End value of the phase ramp.
         `tramp_ns`: Ramp duration in nanoseconds.
@@ -463,20 +463,27 @@ class WieserlabsClient:
         False, the upward ramp has amplitude zero, otherwise the amplitude during the
         upward ramp is simply `amplitude`.
         """
-        print(slot, channel, freq, amp, pstart,
-            pend, tramp_ns, pstep, keep_amplitude_for_hack)
-        norm_pstart = (pstart%360) / 360
-        norm_pend = (pend%360) / 360
-        up_ramp_limit = round(max(norm_pstart, norm_pend) * 2**32)
-        down_ramp_limit = round(min(norm_pstart, norm_pend) * 2**32)
-
-        # Clear accumulator before running the ramp
-        self._clear_ramp_accumulator(slot, channel)
 
         # Here's a list of hacks we have to do to make everything work!
         # The digital ramp generator behaves really annoying.
         # 1. When ramping up to a frequency, then trying to ramp up again, it won't work.
         #    Solution: It works, when we clear the DRCTL pin (by sending update:-d). Then we can do update:+d
+
+        norm_pstart = (pstart%360) / 360
+        norm_pend = (pend%360) / 360
+        up_ramp_limit = round(max(norm_pstart, norm_pend) * 2**32)
+        down_ramp_limit = round(min(norm_pstart, norm_pend) * 2**32)
+
+        do_ramp_down = pstart > pend
+
+        if do_ramp_down:
+            # https://ez.analog.com/dds/f/q-a/28177/ad9910-amplitude-drg-falling-ramp-starting-at-upper-limit
+            self.phase_ramp(slot, channel, freq, int(keep_amplitude_for_hack) * amp,
+                0, pstart, 4, pstart)
+        else:
+            # Clear accumulator before running the ramp
+            self._clear_ramp_accumulator(slot, channel)
+
 
         if norm_pstart == norm_pend:
             print("[ERROR]: pstart and pend cannot be the same!")
@@ -512,9 +519,14 @@ class WieserlabsClient:
         self.push_message(slot, drl_msg)
         self.push_message(slot, drss_msg)
         self.push_message(slot, drr_msg)
-        self.push_message(slot, UpdateMessage(channel, f"u-d"))
-        # self.wait_time(slot, channel, 8)
-        self.push_message(slot, UpdateMessage(channel, f"+d"))
+
+        if do_ramp_down:
+            # Yes, we have to separate it.
+            self.push_message(slot, UpdateMessage(channel, f"u"))
+            self.push_message(slot, UpdateMessage(channel, f"-d"))
+        else:
+            self.push_message(slot, UpdateMessage(channel, f"u-d"))
+            self.push_message(slot, UpdateMessage(channel, f"+d"))
 
     def wait_time(self, slot_index, channel, t_ns):
         if t_ns <= 134 * 1e6:
@@ -590,22 +602,13 @@ client.single_tone(0, 1, 1e6, 0.1, 0)
 client.single_tone(0, 0, 1e6, 0.1, 0)
 client.wait_time(0, 0, 1e9)
 
-# client.phase_ramp(0, 0, 1e6, 0.1, 0, 90, 0.5e9, 0.0001)
-
-# client.phase_ramp(0, 0, 1e6, 0.1, 322, 177, 0.5e9, 0.0001)
-# client.wait_time(0, 0, 0)
-# client.push_message(0, UpdateMessage(0, "-d"))
-
-previous_phase = 0
 from random import random
-for i in range(20):
-    random_phase = random() * 100 + previous_phase
-    if random_phase >= 360:
-        random_phase = random() * 100
-        previous_phase = 0
-
-    client.wait_time(0, 0, 1.2e9)
-    client.phase_ramp(0, 0, 1e6, 0.1, previous_phase, random_phase, 1e9, 0.00001)
+previous_phase = 0
+for i in range(10):
+    random_phase = random() * 360
+    print(f"\t{previous_phase:.2f} -> {random_phase:.2f}")
+    client.phase_ramp(0, 0, 1e6, 0.1, previous_phase, random_phase, 3e9, 1e-5)
     previous_phase = random_phase
+    client.wait_time(0, 0, 4e9)
 
 client.run(0)
