@@ -39,6 +39,17 @@ class TriggerEvent(Enum):
     O_DROVER                = 51  # OTHER CHANNEL, AD9910 ramp complete (DROVER pin)AD9910 RAM sweep over (RAM SWP OVR pin)
     O_RAM_SWP_OVR           = 52  # OTHER CHANNEL, AD9910 RAM sweep over (RAM SWP OVR pin)
 
+class RamParameterType(Enum):
+    FREQUENCY       = 0
+    PHASE           = 1
+    AMPLITUDE       = 2
+    POLAR           = 3     # Phase and amplitude at the same time
+
+class RampType(Enum):
+    FREQUENCY       = 0
+    PHASE           = 1
+    AMPLITUDE       = 2
+
 # We need to convert a frequency to DDS compatible language
 def freq_to_word(f):
     # f in Hz
@@ -58,6 +69,9 @@ def phase_to_word(phase):
     phase = phase%360
     p = round(2**16 * phase / 360)
     return (f"{p:0{4}x}")
+
+def get_bit(v, index):
+    return (v >> index) & 1
 
 def set_bit(v, index, x):
     """Set the index:th bit of v to 1 if x is truthy, else to 0, and return the new value."""
@@ -134,7 +148,10 @@ class WaitMessage(MessageType):
 
 class UpdateMessage(MessageType):
     def __init__(self, channel=None, update_type="u"):
-        self.channel = channel or ""
+        self.channel = ""
+        if channel in [0,1]:
+            self.channel = channel
+
         # For reference on the update_type, see the documentation (can be u,o,d,h,p,a,b,c)
         self.update_type = update_type
 
@@ -185,7 +202,7 @@ class WieserlabsClient:
         self.max_amp = max_amp
 
         self.slots = {}
-        for i in range(0, 1):
+        for i in range(0, 6):
             self.slots[i] = WieserlabsSlot(i)
 
         self._connect_all_slots()
@@ -261,6 +278,7 @@ class WieserlabsClient:
 
         if bit_value != 0 and bit_value != 1:
             print("[ERROR]: Invalid value for bit_value!")
+            raise ValueError()
             return -1
 
         self._cfr_regs[cfr_number-1] = set_bit( self._cfr_regs[cfr_number-1],
@@ -312,10 +330,10 @@ class WieserlabsClient:
         freq_w = freq_to_word(freq)
         return f"0x{amp_w}_{phase_w}_{freq_w}"
 
-    def push_update(self, slot_index, channel):
+    def push_update(self, slot_index, channel, update_type="u"):
         """ Update the DDS, so that the changes take effect
         """
-        msg = UpdateMessage(channel, "u")
+        msg = UpdateMessage(channel, update_type)
         self.push_message(slot_index, msg)
 
     def push_message(self, slot_index, msg):
@@ -363,7 +381,7 @@ class WieserlabsClient:
         self.push_message(slot_index, msg)
 
     def frequency_ramp(self, slot, channel, fstart, fend, amp,
-        phase, tramp_ns, fstep):
+        phase, tramp, fstep, is_filter=False):
 
         if fstart == fend:
             print('[ERROR]: fstart and fend cannot be the same!')
@@ -388,26 +406,28 @@ class WieserlabsClient:
 
         # We have to give the time after which to increase the frequency
         # by the fstep
-        t_step_ns = fstep / abs(fstart - fend) * tramp_ns
+        t_step_ns = fstep / abs(fstart - fend) * tramp * 1e9
         # DDS clock runs at 1/4 * f_SYSCLK, so 250MHz
         time_in_dds_clock = int(t_step_ns/4)
 
         if time_in_dds_clock > 0xffff:
-            print("[ERROR]: Either tramp_ns is too big or fstep.")
+            print("[ERROR]: Either tramp is too big or fstep.")
             return
 
         DRL = f"0x{up_ramp_limit}{down_ramp_limit}"
         DRSS = f"0x{freq_to_word(fstep)}{freq_to_word(fstep)}"
         DRR = f"0x{int(time_in_dds_clock):0{4}x}{int(time_in_dds_clock):0{4}x}"
 
-        # The following command is only needed to set the amplitude and phase
-        self.single_tone(slot, channel, 0, amp, phase)
+        if not is_filter:
+            # The following command is only needed to set the amplitude and phase
+            self.single_tone(slot, channel, 0, amp, phase)
 
         self._clear_ramp_accumulator(slot, channel)
 
-        self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
-        self._set_CFR_bit(slot, channel, 2, 20, 0) # set ramp to be a frequency ramp
-        self._set_CFR_bit(slot, channel, 2, 21, 0, send=True) # set ramp to be a frequency ramp
+        if not is_filter:
+            self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
+            self._set_CFR_bit(slot, channel, 2, 20, 0) # set ramp to be a frequency ramp
+            self._set_CFR_bit(slot, channel, 2, 21, 0, send=True) # set ramp to be a frequency ramp
 
         drl_msg = AD9910RegisterWriteMessage(channel, "DRL", DRL)
         drss_msg = AD9910RegisterWriteMessage(channel, "DRSS", DRSS)
@@ -421,8 +441,10 @@ class WieserlabsClient:
         self.push_message(slot, drl_msg)
         self.push_message(slot, drss_msg)
         self.push_message(slot, drr_msg)
-        self.push_message(slot, UpdateMessage(channel, "u-d"))
-        self.push_message(slot, UpdateMessage(channel, "u+d"))
+
+        if not is_filter:
+            self.push_message(slot, UpdateMessage(channel, "u-d"))
+            self.push_message(slot, UpdateMessage(channel, "u+d"))
 
     def _clear_ramp_accumulator(self, slot, channel):
         # Clear accumulator
@@ -432,7 +454,7 @@ class WieserlabsClient:
         self.push_update(slot, channel)
 
     def phase_ramp(self, slot, channel, freq, amp, pstart,
-        pend, tramp_ns, pstep, keep_amplitude_for_hack=True):
+        pend, tramp, pstep, keep_amplitude_for_hack=True, is_filter=False):
         """
         Start a phase ramp.
 
@@ -444,15 +466,15 @@ class WieserlabsClient:
         `amp`: Amplitude during the phase ramp.
         `pstart`: Start value of the phase ramp.
         `pend`: End value of the phase ramp.
-        `tramp_ns`: Ramp duration in nanoseconds.
+        `tramp`: Ramp duration in nanoseconds.
         `pstep`: Step length for phase ramp (in general, you probably want this to be small).
         `keep_amplitude_for_hack`: See notes.
 
         Notes
         =====
-        The variables `tramp_ns` and `pstep` are both used to calculate the time
+        The variables `tramp` and `pstep` are both used to calculate the time
         after which the phase is increased by `pstep`. The formula for this is:
-        $t_step_ns = pstep * tramp_ns / |pstart - pend|$.
+        $t_step_ns = pstep * tramp / |pstart - pend| * 1e9$.
         The resulting value cannot exceed 0xffff. If it does, we won't do the ramp
         and instead print an error.
 
@@ -476,14 +498,14 @@ class WieserlabsClient:
 
         do_ramp_down = pstart > pend
 
-        if do_ramp_down:
-            # https://ez.analog.com/dds/f/q-a/28177/ad9910-amplitude-drg-falling-ramp-starting-at-upper-limit
-            self.phase_ramp(slot, channel, freq, int(keep_amplitude_for_hack) * amp,
-                0, pstart, 4, pstart)
-        else:
-            # Clear accumulator before running the ramp
-            self._clear_ramp_accumulator(slot, channel)
-
+        if not is_filter:
+            if do_ramp_down:
+                # https://ez.analog.com/dds/f/q-a/28177/ad9910-amplitude-drg-falling-ramp-starting-at-upper-limit
+                self.phase_ramp(slot, channel, freq, int(keep_amplitude_for_hack) * amp,
+                    0, pstart, 4, pstart)
+            else:
+                # Clear accumulator before running the ramp
+                self._clear_ramp_accumulator(slot, channel)
 
         if norm_pstart == norm_pend:
             print("[ERROR]: pstart and pend cannot be the same!")
@@ -491,7 +513,7 @@ class WieserlabsClient:
 
         # We have to give the time after which to increase the phase
         # by the pstep
-        t_step_ns = pstep / abs(pstart - pend) * tramp_ns
+        t_step_ns = pstep / abs(pstart - pend) * tramp * 1e9
         # DDS clock runs at 1/4 * f_SYSCLK, so 250MHz
         time_in_dds_clock = int(t_step_ns/4)
 
@@ -505,12 +527,13 @@ class WieserlabsClient:
         DRSS = f"0x{phase_step_format}{phase_step_format}"
         DRR = f"0x{int(time_in_dds_clock):0{4}x}{int(time_in_dds_clock):0{4}x}"
 
-        # The following command is only needed to set the frequency and amplitude
-        self.single_tone(slot, channel, freq, amp, 0)
+        if not is_filter:
+            # The following command is only needed to set the frequency and amplitude
+            self.single_tone(slot, channel, freq, amp, 0)
 
-        self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
-        self._set_CFR_bit(slot, channel, 2, 20, 1) # set ramp to be a phase ramp
-        self._set_CFR_bit(slot, channel, 2, 21, 0, send=True) # set ramp to be a phase ramp
+            self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
+            self._set_CFR_bit(slot, channel, 2, 20, 1) # set ramp to be a phase ramp
+            self._set_CFR_bit(slot, channel, 2, 21, 0, send=True) # set ramp to be a phase ramp
 
         drl_msg = AD9910RegisterWriteMessage(channel, "DRL", DRL)
         drss_msg = AD9910RegisterWriteMessage(channel, "DRSS", DRSS)
@@ -520,16 +543,17 @@ class WieserlabsClient:
         self.push_message(slot, drss_msg)
         self.push_message(slot, drr_msg)
 
-        if do_ramp_down:
-            # Yes, we have to separate it.
-            self.push_message(slot, UpdateMessage(channel, f"u"))
-            self.push_message(slot, UpdateMessage(channel, f"-d"))
-        else:
-            self.push_message(slot, UpdateMessage(channel, f"u-d"))
-            self.push_message(slot, UpdateMessage(channel, f"+d"))
+        if not is_filter:
+            if do_ramp_down:
+                # Yes, we have to separate it.
+                self.push_message(slot, UpdateMessage(channel, f"u"))
+                self.push_message(slot, UpdateMessage(channel, f"-d"))
+            else:
+                self.push_message(slot, UpdateMessage(channel, f"u-d"))
+                self.push_message(slot, UpdateMessage(channel, f"+d"))
 
     def amplitude_ramp(self, slot, channel, freq, astart, aend,
-        phase, tramp_ns, astep):
+        phase, tramp, astep, is_filter=False):
         """
         Start a phase ramp.
 
@@ -541,14 +565,14 @@ class WieserlabsClient:
         `astart`: Start value of the amplitude ramp.
         `aend`: Start value of the amplitude ramp.
         `phase`: Phase during the amplitude ramp.
-        `tramp_ns`: Ramp duration in nanoseconds.
+        `tramp`: Ramp duration in nanoseconds.
         `astep`: Step length for amplitude ramp (in general, you probably want this to be small).
 
         Notes
         =====
-        The variables `tramp_ns` and `pstep` are both used to calculate the time
+        The variables `tramp` and `pstep` are both used to calculate the time
         after which the phase is increased by `pstep`. The formula for this is:
-        $t_step_ns = astep * tramp_ns / |astart - aend|$.
+        $t_step_ns = astep * tramp / |astart - aend| * 1e9$.
         The resulting value cannot exceed 0xffff. If it does, we won't do the ramp
         and instead print an error.
         """
@@ -558,17 +582,18 @@ class WieserlabsClient:
         # 1. When ramping up to a amplitude, then trying to ramp up again, it won't work.
         #    Solution: It works, when we clear the DRCTL pin (by sending update:-d). Then we can do update:+d
 
-        up_ramp_limit = round(max(astart, aend, 0) * 2**32)
-        down_ramp_limit = round(min(astart, aend, 1) * 2**32)
+        up_ramp_limit = round(max(astart, aend, 0) * (2**32-1))
+        down_ramp_limit = round(min(astart, aend, 1) * (2**32-1))
 
         do_ramp_down = astart > aend
 
-        if do_ramp_down:
-            # https://ez.analog.com/dds/f/q-a/28177/ad9910-amplitude-drg-falling-ramp-starting-at-upper-limit
-            self.amplitude_ramp(slot, channel, freq, 0, astart, phase, 4, astart)
-        else:
-            # Clear accumulator before running the ramp
-            self._clear_ramp_accumulator(slot, channel)
+        if not is_filter:
+            if do_ramp_down:
+                # https://ez.analog.com/dds/f/q-a/28177/ad9910-amplitude-drg-falling-ramp-starting-at-upper-limit
+                self.amplitude_ramp(slot, channel, freq, 0, astart, phase, 4, astart)
+            else:
+                # Clear accumulator before running the ramp
+                self._clear_ramp_accumulator(slot, channel)
 
 
         if astart == aend:
@@ -577,12 +602,12 @@ class WieserlabsClient:
 
         # We have to give the time after which to increase the amp
         # by the pstep
-        t_step_ns = astep / abs(astart - aend) * tramp_ns
+        t_step_ns = astep / abs(astart - aend) * tramp * 1e9
         # DDS clock runs at 1/4 * f_SYSCLK, so 250MHz
         time_in_dds_clock = int(t_step_ns/4)
 
         if time_in_dds_clock > 0xffff:
-            print("[ERROR]: Either tramp_ns is too big or astep.")
+            print("[ERROR]: Either tramp is too big or astep.")
             return
 
         amp_step_format = f"{round(astep*2**32):0{8}x}"
@@ -591,12 +616,13 @@ class WieserlabsClient:
         DRSS = f"0x{amp_step_format}{amp_step_format}"
         DRR = f"0x{int(time_in_dds_clock):0{4}x}{int(time_in_dds_clock):0{4}x}"
 
-        # The following command is only needed to set the frequency and amplitude
-        self.single_tone(slot, channel, freq, 0, phase)
+        if not is_filter:
+            # The following command is only needed to set the frequency and phase
+            self.single_tone(slot, channel, freq, 0, phase)
 
-        self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
-        self._set_CFR_bit(slot, channel, 2, 20, 0) # set ramp to be a phase ramp
-        self._set_CFR_bit(slot, channel, 2, 21, 1, send=True) # set ramp to be a phase ramp
+            self._set_CFR_bit(slot, channel, 2, 19, 1) # enable ramp
+            self._set_CFR_bit(slot, channel, 2, 20, 0) # set ramp to be a phase ramp
+            self._set_CFR_bit(slot, channel, 2, 21, 1, send=True) # set ramp to be a phase ramp
 
         drl_msg = AD9910RegisterWriteMessage(channel, "DRL", DRL)
         drss_msg = AD9910RegisterWriteMessage(channel, "DRSS", DRSS)
@@ -606,15 +632,18 @@ class WieserlabsClient:
         self.push_message(slot, drss_msg)
         self.push_message(slot, drr_msg)
 
-        if do_ramp_down:
-            # Yes, we have to separate it.
-            self.push_message(slot, UpdateMessage(channel, f"u"))
-            self.push_message(slot, UpdateMessage(channel, f"-d"))
-        else:
-            self.push_message(slot, UpdateMessage(channel, f"u-d"))
-            self.push_message(slot, UpdateMessage(channel, f"+d"))
+        if not is_filter:
+            if do_ramp_down:
+                # Yes, we have to separate it.
+                self.push_message(slot, UpdateMessage(channel, f"u"))
+                self.push_message(slot, UpdateMessage(channel, f"-d"))
+            else:
+                self.push_message(slot, UpdateMessage(channel, f"u-d"))
+                self.push_message(slot, UpdateMessage(channel, f"+d"))
 
-    def wait_time(self, slot_index, channel, t_ns):
+    def wait_time(self, slot_index, channel, t):
+        t_ns = t * 1e9
+
         if t_ns <= 134 * 1e6:
             # For times less than 134ms, we can use the high resolution mode
             val = round(t_ns / 8)
@@ -636,7 +665,9 @@ class WieserlabsClient:
         msg = WaitMessage(channel, time_string, "")
         self.push_message(slot_index, msg)
 
-    def wait_trigger(self, slot_index, channel, trigger_events, timeout_ns=-1):
+    def wait_trigger(self, slot_index, channel, trigger_events, timeout=-1):
+        timeout_ns = timeout * 1e9
+
         if type(trigger_events) != list:
             trigger_events = [trigger_events]
 
@@ -666,12 +697,119 @@ class WieserlabsClient:
         msg = WaitMessage(channel, time_string, trig_string)
         self.push_message(slot_index, msg)
 
+    def from_memory(self, slot_index, channel, param_type, storage,
+        freq, amp, phase, tramp, ramp_filter=None):
+        """Store waveforms in the RAM of the AD9910.
+
+        Parameters:
+        ===========
+        param_type: Needs to be of RamParameterType. We can only store one parameter type
+                    into the RAM at the same time.
+        storage:    A list of parameter type (e.g. frequencies). Cannot be larger than 1024.
+        """
+
+        if not isinstance(param_type, RamParameterType):
+            print("[ERROR]: param_type is not of type RamParameterType!")
+            return -1
+
+        if not isinstance(storage, list):
+            print("[ERROR]: storage is not a list!")
+            return -1
+
+        # Have to invert the list because playback is back to front
+        storage = storage[::-1]
+
+        if len(storage) == 0:
+            print("[ERROR]: storage is empty!")
+            return -1
+        elif len(storage) >= 1024:
+            print("[ERROR]: storage is too big!")
+            return -1
+
+        for s in storage:
+            try:
+                float(s)
+            except:
+                print("[ERROR]: something in storage can't be cast to float!")
+                return -1
+
+        retrv_freq = lambda x, shift: round(2**32/1e9*x) & 0xffff_ffff << shift
+        retrv_phase = lambda x, shift: round(2**16 * (x%360) / 360) << shift
+        retrv_amp = lambda x, shift: round(max(0, min(0x3fff, 0x3fff*x))) << shift
+        if param_type == RamParameterType.FREQUENCY:
+            retrv_fct = lambda x: retrv_freq(x, 0)
+        elif param_type == RamParameterType.PHASE:
+            retrv_fct = lambda x: retrv_phase(x, 16)
+        elif param_type == RamParameterType.AMPLITUDE:
+            retrv_fct = lambda x: retrv_amp(x, 18)
+        elif param_type == RamParameterType.POLAR:
+            print("[NOT IMPLEMENTED]: Sorry...")
+            return -1
+
+        # Program freq, amp, phase
+        val = f"0x{retrv_freq(freq, 0):0{8}x}"
+        self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "FTW", val))
+        val = f"0x{retrv_amp(amp, 2):0{8}x}"
+        self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "ASF", val))
+        val = f"0x{retrv_phase(phase, 0):0{4}x}"
+        self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "POW", val))
+        # --------------------------------------------
+
+        # Program the parameters of the RAM playback ----
+        t_step = tramp / len(storage)
+
+        step_rate = round((t_step * 1e9 / 4)) << 40
+        end_idx = len(storage) << 30
+        start_idx = 0 << 14
+        no_dwell = 0 << 5
+        ram_mode_control = 1 # ramp-up
+
+        ram_register_fmt = step_rate | end_idx | start_idx | no_dwell | ram_mode_control
+        msg = f"0x{ram_register_fmt:0{16}x}"
+        self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "stp0", msg))
+        # ----------------------------------------------
+
+        self.push_update(slot_index, channel, "=1p")
+        self.push_update(slot_index, channel, "=0p")
+
+        self._set_CFR_bit(slot_index, channel, 1, 29, get_bit(param_type.value, 0)) # set output type
+        self._set_CFR_bit(slot_index, channel, 1, 30, get_bit(param_type.value, 1)) # set output type
+        self._set_CFR_bit(slot_index, channel, 1, 31, 1, send=True) # enable RAM
+
+        if ramp_filter != None:
+            self._set_CFR_bit(slot_index, channel, 2, 19, 1) # enable ramp
+            self._set_CFR_bit(slot_index, channel, 2, 20, get_bit(ramp_filter.value, 0)) # set ramp to be a frequency ramp
+            self._set_CFR_bit(slot_index, channel, 2, 21, get_bit(ramp_filter.value, 1), send=True) # set ramp to be a frequency ramp
+
+        self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "RAMB", "0:c"))
+        last_index = len(storage) // 2 - 1
+        for i in range(len(storage) // 2):
+            # We can store two values at the same time, therefore we retrieve two values from the storage
+            first = retrv_fct(storage[i*2])
+            second = retrv_fct(storage[i*2+1])
+            val = f"0x{first:0{8}x}_{second:0{8}x}"
+
+            if i != last_index:
+                self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "RAM64C", f"{val}:c"))
+            else:
+                if len(storage)%2 == 0:
+                    self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "RAM64E", f"{val}"))
+                else:
+                    # If we have an uneven number of values in storage, the last is actually the second
+                    # to last, since we rounded the length down
+                    self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "RAM64C", f"{val}:c"))
+
+                    last = retrv_fct(storage[-1])
+                    val = f"0x{last:0{8}x}"
+                    self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "RAM64E", f"{val}"))
+        self.push_update(slot_index, channel)
+
     def run(self, slot_index, no_update=False):
         slot = self.slots[slot_index]
 
         if not no_update:
             # Add an update, just to be sure
-            last_msg = self.slots[slot_index].message_stack[-1]
+            last_msg = (self.slots[slot_index].message_stack or [None])[-1]
             if not isinstance(last_msg, UpdateMessage):
                 update_msg = UpdateMessage()
                 self.push_message(slot_index, update_msg)
@@ -684,37 +822,25 @@ client = WieserlabsClient("10.0.0.237", max_amp=17.38)
 client.reset(0)
 client.run(0)
 
-client.single_tone(0, 0, 1e6, 0.1, 0)
-client.single_tone(0, 1, 1e6, 0.1, 0)
-client.wait_time(0, 0, 1e9)
-client.wait_time(0, 1, 1e9)
+client.single_tone(0, 1, 1e6, 1 ,0)
+client.wait_time(0, 1, 2e-6)
+client.single_tone(0, 1, 1e6, 0 ,0)
+client.push_update(0, 1)
 
-sweep_time = 0.5e9
+import numpy as np
 
-from random import random
-previous_amp = 0.1
-previous_f = 1e6
-previous_phase = 0
-for i in range(30):
-    r = random()
-    if r < 0.33333:
-        random_amp = random() * 0.2
-        print(f"amp -> {random_amp}")
-        client.amplitude_ramp(0, 0, previous_f, previous_amp, random_amp, previous_phase, sweep_time, 1e-8)
-        previous_amp = random_amp
-    elif r < 0.666666:
-        random_f = random()*2e6 + 1e6
-        print(f"f -> {random_f}")
-        client.frequency_ramp(0, 0, previous_f, random_f, previous_amp, previous_phase, sweep_time, 1)
-        client.frequency_ramp(0, 1, previous_f, random_f, 0.1, 0, sweep_time, 1)
-        previous_f = random_f
-    else:
-        random_phase = random() * 360
-        print(f"phase -> {random_phase}")
-        client.phase_ramp(0, 0, previous_f, previous_amp, previous_phase, random_phase, sweep_time, 1e-5)
-        previous_phase = random_phase
-    client.wait_time(0, 0, sweep_time + 1e9)
-    client.wait_time(0, 1, sweep_time + 1e9)
+# client.phase_ramp(0, 0, 1e6, 1, 0, 359, 0.1, 1e-2, is_filter=False)
+client.amplitude_ramp(0, 0, 1e6, 0, 1, 0, 60e-6, 1e-4, is_filter=True)
+# client.frequency_ramp(0, 0, 1e6, 2e6, 1, 0, 1, 1, is_filter=False)
+# xfine = np.linspace(0, np.pi, 100)
+# yfine = list(np.sin(xfine))
+# client.from_memory(0, 0, RamParameterType.AMPLITUDE, yfine,
+#     1e6, 1, 0, 50e-6, ramp_filter=RampType.PHASE)
 
+
+xfine = np.linspace(1e6, 2e6, 100)
+yfine = list(xfine)
+client.from_memory(0, 0, RamParameterType.FREQUENCY, yfine,
+    1e6, 1, 0, 50e-6, ramp_filter=RampType.AMPLITUDE)
 
 client.run(0)
