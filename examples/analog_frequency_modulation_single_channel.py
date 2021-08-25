@@ -1,3 +1,4 @@
+import logging
 import sys
 sys.path.append('../')
 
@@ -20,7 +21,7 @@ output_map = VoltageToOutputMap(VoltageToOutputMap.ChannelType.CH0_ONLY,
     v2ch0=1, out2=2e6)
 
 # Initialize and reset to start with a clean slate
-client = WieserlabsClient("10.0.0.237", max_amp=17.38)
+client = WieserlabsClient("10.0.0.237", max_amp=17.38, loglevel=logging.INFO)
 client.reset(0)
 client.run(0)
 
