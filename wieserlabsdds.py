@@ -1,6 +1,7 @@
 import socket
 import sys
 import time
+import numpy as np
 from enum import Enum
 
 def push_or_pop(list_to_check, value, action_on_pop):
@@ -45,10 +46,10 @@ class RamParameterType(Enum):
     AMPLITUDE       = 2
     POLAR           = 3     # Phase and amplitude at the same time
 
-class RampType(Enum):
-    FREQUENCY       = 0
+class OutputType(Enum):
+    AMPLITUDE       = 0
     PHASE           = 1
-    AMPLITUDE       = 2
+    FREQUENCY       = 2
 
 # We need to convert a frequency to DDS compatible language
 def freq_to_word(f):
@@ -133,7 +134,7 @@ class DCPRegisterWriteMessage(MessageType):
     def get_message(self):
         """ Gets the message of the dcp register write command
         """
-        return self.clean_msg(f"dcp {self.channel} wr:{self.register_name}={self.register_value}")
+        return self.clean_msg(f"dcp {self.channel} wr:{self.register_name}={self.value}")
 
 class WaitMessage(MessageType):
     def __init__(self, channel, wait_time_string, wait_event_string):
@@ -148,8 +149,8 @@ class WaitMessage(MessageType):
 
 class UpdateMessage(MessageType):
     def __init__(self, channel=None, update_type="u"):
-        self.channel = ""
-        if channel in [0,1]:
+        self.channel = None
+        if channel in [0, 1]:
             self.channel = channel
 
         # For reference on the update_type, see the documentation (can be u,o,d,h,p,a,b,c)
@@ -158,7 +159,131 @@ class UpdateMessage(MessageType):
     def get_message(self):
         """ Gets the messaeg of the update command
         """
-        return self.clean_msg(f"dcp {self.channel} update:{self.update_type}")
+        channel_string = self.channel if self.channel != None else ""
+        return self.clean_msg(f"dcp {channel_string} update:{self.update_type}")
+
+class VoltageToOutputMap:
+    """
+    This class is used for analog modulation, where we have to solve a system of linear
+    equations. Using this class, we can give starting conditions.
+
+    This class solves the following equations for s0, s1 and offset:
+    out1 = (v1ch0 * s0 + v1ch1 * s1) / 2**12 + offset
+    out2 = (v2ch0 * s0 + v2ch1 * s1) / 2**12 + offset
+    out3 = (v3ch0 * s0 + v3ch1 * s1) / 2**12 + offset
+
+    When doing analog modulation, we map analog voltages to output values depending on the
+    type we want to modulate. So frequencies are in Hz, phases in rad and amplitudes from 0 to 1.
+    (Actually, these values are FTW, POW and ASF, you probably don't have to use this function,
+    but refer to the AD9910 datasheet if you're curious. It is the result from the *_to_word functions)
+    This means out[N] is the output value given a input voltage v[N]ch0 at channel 0 and v[N]ch1
+    at channel 1. If we know we only modulate on one channel, the set of equations reduce to 2 and
+    consequently, the values for the other channel, as well as the variants for the third
+    equation are ignored and do not have to be given.
+
+    CAREFUL: When setting the output type to frequency, make sure to give the maximum
+    reachable frequency as one of the output values, otherwise the result may not be what
+    you expect!
+    """
+    class ChannelType(Enum):
+        CH0_ONLY  = 1
+        CH1_ONLY  = 2
+        BOTH      = 3
+
+    def __init__(self, use_outputs, output_type,
+        v1ch0=0, v1ch1=0, out1=0,
+        v2ch0=0, v2ch1=0, out2=0,
+        v3ch0=0, v3ch1=0, out3=0):
+
+        if not isinstance(use_outputs, VoltageToOutputMap.ChannelType):
+            print("[ERROR]: use_outputs needs to be of type VoltageToOutputMap.ChannelType!")
+            return -1
+
+        if not isinstance(output_type, OutputType):
+            print("[ERROR]: output_type needs to be of type OutputType!")
+            return -1
+
+        if output_type == OutputType.FREQUENCY:
+            num = max(out1, out2, out3 or 0)
+            num = (round(2**32/1e9*num) & 0xffff_ffff)
+            self.min_gain_setting = int(np.ceil(np.log2(num)) - 16)
+            out_fct = lambda x: (round(2**32/1e9*x) & 0xffff_ffff) >> self.min_gain_setting
+        elif output_type == OutputType.PHASE:
+            out_fct = lambda x: round(2**16 * x / 360)
+        elif output_type == OutputType.AMPLITUDE:
+            # TODO: MAKE SURE THIS IS CORRECT!
+            out_fct = lambda x: round(max(0, min(0x3fff, 0x3fff*x))) << 2
+        self.output_type = output_type
+
+        volt_fct = lambda x: x*2**15 if x < 0 else (x*(2**15-1))
+
+        self.use_outputs = use_outputs
+
+        self.out1 = out_fct(out1)
+        self.out2 = out_fct(out2)
+        self.out3 = out_fct(out3)
+        self.v1ch0 = volt_fct(v1ch0)
+        self.v2ch0 = volt_fct(v2ch0)
+        self.v3ch0 = volt_fct(v3ch0)
+        self.v1ch1 = volt_fct(v1ch1)
+        self.v2ch1 = volt_fct(v2ch1)
+        self.v3ch1 = volt_fct(v3ch1)
+
+    def get_eqn_parameters(self):
+        """
+        In accordance to the class description, this function solves the linear equations.
+
+        Return values
+        =============
+        s0, s1, offset
+        """
+        A = self.out1
+        B = self.v1ch0
+        C = self.v1ch1
+
+        D = self.out2
+        E = self.v2ch0
+        F = self.v2ch1
+
+        G = self.out2
+        H = self.v2ch0
+        I = self.v2ch1
+
+        if self.use_outputs == VoltageToOutputMap.ChannelType.CH0_ONLY:
+            # x1 = offset * 2**12
+            # y1 = out1 * 2**12 = v1ch0 * x0 + x1
+            # y2 = out2 * 2**12 = v2ch0 * x0 + x1
+            y = np.array([A, D])*2**12
+            p = np.array([[B, 1], [E, 1]])
+            x0, x1 = np.linalg.solve(p, y)
+            s0 = x0
+            offset = x1 * 2**-12
+            s1 = 0
+
+        elif self.use_outputs == VoltageToOutputMap.ChannelType.CH1_ONLY:
+            # x1 = offset * 2**12
+            # y1 = out1 * 2**12 = v1ch1 * x0 + x1
+            # y2 = out2 * 2**12 = v2ch1 * x0 + x1
+            y = np.array([A, D])*2**12
+            p = np.array([[C, 1], [F, 1]])
+            x0, x1 = np.linalg.solve(p, y)
+            s1 = x0
+            offset = x1 * 2**-12
+            s0 = 0
+        else:
+            # x2 = offset * 2**12
+            # y1 = out1 * 2**12 = v1ch0 * x0 + v1ch1 * x1 + x2
+            # y2 = out2 * 2**12 = v2ch0 * x0 + v2ch1 * x1 + x2
+            # y3 = out3 * 2**12 = v3ch0 * x0 + v3ch1 * x1 + x2
+            y = np.array([A, D, G]) * 2**12
+            p = np.array([[B, C, 1], [E, F, 1], [G, H, 1]])
+            x0, x1, x2 = np.linalg.solve(p, y)
+            s0 = x0
+            s1 = x1
+            offset = x2 * 2**-12
+
+        print(s0, s1, offset)
+        return s0, s1, offset
 
 class WieserlabsSlot:
     """
@@ -173,6 +298,27 @@ class WieserlabsSlot:
         self.index = index
         self.message_stack = []
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        # The control function register is saved on the DDS, however we need to have
+        # a local copy since we have to write it completely if we want to change
+        # some bits. We have two CFRs for each channel
+        self.cfr_regs = [[0x00410002, 0x004008C0], [0x00410002, 0x004008C0]]
+
+        # I initially wanted to create the list as follows:
+        # self.cfr_regs = [[0x00410002, 0x004008C0]] * 2
+
+        # However then I found out, that using the asterisk operator creates multiple references
+        # to the same list!
+        # >>> a = 1
+        # >>> b = 2
+        # >>> v = [[a,b]] * 2
+        # >>> v
+        # [[1, 2], [1, 2]]
+        # >>> v[0][0] = 3
+        # >>> v
+        # [[3, 2], [3, 2]]
+        # For whomever it may be useful.
+
 
         # When changing settings of registers, we have to send an update for the
         # changes to take effect. However we don't want to spam update events
@@ -256,7 +402,7 @@ class WieserlabsClient:
             # TODO ?
             raise ValueError()
 
-    def _set_CFR_bit(self, slot, channel, cfr_number, bit_number, bit_value, send=False):
+    def _set_CFR_bit(self, slot_index, channel, cfr_number, bit_number, bit_value, send=False):
         """
         This is a super-super low-level function and should only be called by
         someone who knows what they are doing! Anyways, this sets bits in the
@@ -265,7 +411,9 @@ class WieserlabsClient:
 
         If send=False, we will only change the register stored in this program.
         """
-        if self._validate_slot_channel(slot, channel) == -1:
+        slot = self.slots[slot_index]
+
+        if self._validate_slot_channel(slot_index, channel) == -1:
             return -1
 
         if cfr_number != 1 and cfr_number != 2:
@@ -281,25 +429,28 @@ class WieserlabsClient:
             raise ValueError()
             return -1
 
-        self._cfr_regs[cfr_number-1] = set_bit( self._cfr_regs[cfr_number-1],
+        slot.cfr_regs[channel][cfr_number-1] = set_bit( slot.cfr_regs[channel][cfr_number-1],
                                                 bit_number,
                                                 bit_value)
 
         if send:
-            val = f"{self._cfr_regs[cfr_number-1]:#0{10}x}"
-            msg = AD9910RegisterWriteMessage(channel, f"CFR{cfr_number}", val)
-            # msg = f"dcp {channel} spi:CFR{cfr_number}={val}"
-            self.push_message(slot, msg)
+            val = f"{slot.cfr_regs[channel][cfr_number-1]:#0{10}x}"
+            msg_stack = self.slots[slot_index].message_stack
 
-    def _reset_cfr(self, slot):
-        self._cfr_regs = [0x00410002, 0x004008C0]
+            msg = AD9910RegisterWriteMessage(channel, f"CFR{cfr_number}", val)
+            self.push_message(slot_index, msg)
+
+    def _reset_cfr(self, slot_index):
+        slot = self.slots[slot_index]
+
+        slot.cfr_regs = [[0x00410002, 0x004008C0], [0x00410002, 0x004008C0]]
         for cfr_number in range(2):
             for channel in range(2):
-                val = f"{self._cfr_regs[cfr_number]:#0{10}x}"
+                val = f"{slot.cfr_regs[channel][cfr_number]:#0{10}x}"
                 msg = AD9910RegisterWriteMessage(channel, f"CFR{cfr_number+1}", val)
-                # msg = f"dcp {channel} spi:CFR{cfr_number+1}={val}"
-                self.push_message(slot, msg)
-        self.run(slot)
+                self.push_message(slot_index, msg)
+
+        self.run(slot_index)
 
     def _connect_all_slots(self):
         """ Connect to port 2600n, where n is card number (0 here = first card) """
@@ -331,9 +482,29 @@ class WieserlabsClient:
         return f"0x{amp_w}_{phase_w}_{freq_w}"
 
     def push_update(self, slot_index, channel, update_type="u"):
-        """ Update the DDS, so that the changes take effect
         """
-        msg = UpdateMessage(channel, update_type)
+        Update the DDS, so that the changes take effect
+        This function checks if the last message of this channel was an update.
+        If it was, it won't push an update.
+        """
+        msg_stack = self.slots[slot_index].message_stack
+        for msg in reversed(msg_stack):
+            if not isinstance(msg, UpdateMessage):
+                if msg.channel == None or msg.channel == channel:
+                    # The last message in the stack for this channel (or both)
+                    # is not an update, therefore we need to insert one
+                    break
+            else:
+                if msg.channel != None and msg.channel != channel:
+                    # Modify the last update to span both channels
+                    msg.channel = None
+                    return
+
+                if msg.channel == None or msg.channel == channel:
+                    # There is an update acting on both channels or this channel
+                    return
+
+        msg = UpdateMessage(channel)
         self.push_message(slot_index, msg)
 
     def push_message(self, slot_index, msg):
@@ -367,9 +538,11 @@ class WieserlabsClient:
         """
 
         # Make sure single tone amplitude control is on
-        client._set_CFR_bit(slot_index, channel, 2, 24, 1)
+        self._set_CFR_bit(slot_index, channel, 2, 24, 1)
+        # and parallel data port is disabled
+        self._set_CFR_bit(slot_index, channel, 2, 4, 0)
         # and ramp control is off
-        client._set_CFR_bit(slot_index, channel, 2, 19, 0, send=True)
+        self._set_CFR_bit(slot_index, channel, 2, 19, 0, send=True)
 
         # Generate the command
         # cmd = self._freq_command(channel, freq, amp, phase%360)
@@ -658,9 +831,7 @@ class WieserlabsClient:
         # (Imaging the scenario: Setting a frequency, waiting, setting a different
         # frequency. Without the update, the chip does nothing, waits, then
         # sets the new frequency. The old frequency is never set).
-        msg_stack = self.slots[slot_index].message_stack
-        if len(msg_stack) > 0 and not isinstance(msg_stack[-1], UpdateMessage):
-            self.push_update(slot_index, channel)
+        self.push_update(slot_index, channel)
 
         msg = WaitMessage(channel, time_string, "")
         self.push_message(slot_index, msg)
@@ -699,7 +870,8 @@ class WieserlabsClient:
 
     def from_memory(self, slot_index, channel, param_type, storage,
         freq, amp, phase, tramp, ramp_filter=None):
-        """Store waveforms in the RAM of the AD9910.
+        """
+        Store waveforms in the RAM of the AD9910.
 
         Parameters:
         ===========
@@ -804,43 +976,112 @@ class WieserlabsClient:
                     self.push_message(slot_index, AD9910RegisterWriteMessage(channel, "RAM64E", f"{val}"))
         self.push_update(slot_index, channel)
 
+    def analog_modulation(self, slot_index, channel,
+        voltage_to_output_map):
+        """
+        Do an analog modulation from an input that we define in voltage_to_output_map.
+
+        We get the output type of the modulation from voltage_to_output_map
+
+        Parameters:
+        ===========
+        voltage_to_output_map: The parameter is of type VoltageToOutputMap.
+                               Using this, we define which voltage from the
+                               analog input maps to the amplitude/frequency/phase on the
+                               output.
+        """
+
+        if not isinstance(voltage_to_output_map, VoltageToOutputMap):
+            print("[ERROR]: voltage_to_output_map needs to be of type VoltageToOutputMap!")
+
+        s0, s1, offset = voltage_to_output_map.get_eqn_parameters()
+
+        # if we are doing frequency modulation, we need to set the frequency gain
+        # on the AD9910, since the analog input is 16bit, while the frequency
+        # range is covered by 32bits.
+        if voltage_to_output_map.output_type == OutputType.FREQUENCY:
+            gain = voltage_to_output_map.min_gain_setting
+            for i in range(4):
+                self._set_CFR_bit(slot_index, channel, 2, i, get_bit(gain, i))
+        # Make sure that the parallel data port is enabled (meaning, that the
+        # AD9910 reads the analog input)
+        self._set_CFR_bit(slot_index, channel, 2, 4, 1, send=True)
+
+        msg_s0 = DCPRegisterWriteMessage(channel, "AM_S0", hex(round(s0)))
+        msg_s1 = DCPRegisterWriteMessage(channel, "AM_S1", hex(round(s1)))
+
+        # We set O0 and O1 to zero. These are supposed to correct for errors
+        # in the DAC. However I don't know how to estimate these values
+        # and I will assume for now, that it's not necessary.
+        msg_offset_0 = DCPRegisterWriteMessage(channel, "AM_O0", 0)
+        msg_offset_1 = DCPRegisterWriteMessage(channel, "AM_O1", 0)
+
+        msg_offset_glob = DCPRegisterWriteMessage(channel, "AM_O", hex(round(offset)))
+
+        # am_cfg is a 32bit register, however we only use the first two bits.
+        # For amplitude modulation, these are 00
+        # For phase modulation, these are 01
+        # For frequency modulation, these are 10
+        am_cfg = hex(set_bit(voltage_to_output_map.output_type.value, 29, 1))
+        msg_mod_type = DCPRegisterWriteMessage(channel, "AM_CFG", am_cfg)
+
+        # Push all messages that we just generated
+        for m in [msg_s0, msg_s1, msg_offset_0, msg_offset_1, msg_offset_glob, msg_mod_type]:
+            self.push_message(slot_index, m)
+
+        # Force an update such that the changes are effective
+        self.push_update(slot_index, channel)
+
     def run(self, slot_index, no_update=False):
         slot = self.slots[slot_index]
 
         if not no_update:
             # Add an update, just to be sure
             last_msg = (self.slots[slot_index].message_stack or [None])[-1]
+
             if not isinstance(last_msg, UpdateMessage):
                 update_msg = UpdateMessage()
                 self.push_message(slot_index, update_msg)
+            else:
+                # Sometimes, the last update is channel-specific, but we definitely
+                # want to update all channels!
+                last_msg.channel = ""
 
         payload = "\n".join([v.get_message() for v in slot.message_stack])
         self._send_receive(slot_index, payload)
         slot.message_stack.clear()
 
-client = WieserlabsClient("10.0.0.237", max_amp=17.38)
-client.reset(0)
-client.run(0)
-
-client.single_tone(0, 1, 1e6, 1 ,0)
-client.wait_time(0, 1, 2e-6)
-client.single_tone(0, 1, 1e6, 0 ,0)
-client.push_update(0, 1)
-
-import numpy as np
-
-# client.phase_ramp(0, 0, 1e6, 1, 0, 359, 0.1, 1e-2, is_filter=False)
-client.amplitude_ramp(0, 0, 1e6, 0, 1, 0, 60e-6, 1e-4, is_filter=True)
-# client.frequency_ramp(0, 0, 1e6, 2e6, 1, 0, 1, 1, is_filter=False)
-# xfine = np.linspace(0, np.pi, 100)
-# yfine = list(np.sin(xfine))
-# client.from_memory(0, 0, RamParameterType.AMPLITUDE, yfine,
-#     1e6, 1, 0, 50e-6, ramp_filter=RampType.PHASE)
-
-
-xfine = np.linspace(1e6, 2e6, 100)
-yfine = list(xfine)
-client.from_memory(0, 0, RamParameterType.FREQUENCY, yfine,
-    1e6, 1, 0, 50e-6, ramp_filter=RampType.AMPLITUDE)
-
-client.run(0)
+# _map = VoltageToOutputMap(VoltageToOutputMap.ChannelType.CH0_ONLY,
+#     OutputType.AMPLITUDE,
+#     v1ch0=-1, out1=0.3,
+#     v2ch0=1, out2=1)
+#
+# client = WieserlabsClient("10.0.0.237", max_amp=17.38)
+# client.reset(0)
+# client.run(0)
+#
+# client.single_tone(0, 0, 1e6, 1 ,0)
+# client.single_tone(0, 1, 1e6, 1 ,0)
+# client.wait_time(0, 1, 2e-6)
+# client.single_tone(0, 1, 1e6, 0 ,0)
+# client.push_update(0, 0)
+#
+# client.analog_amplitude_modulation(0, 0, _map)
+#
+# import numpy as np
+#
+# # client.phase_ramp(0, 0, 1e6, 1, 0, 359, 0.1, 1e-2, is_filter=False)
+# client.amplitude_ramp(0, 0, 1e6, 0, 1, 0, 60e-6, 1e-4, is_filter=True)
+# # client.frequency_ramp(0, 0, 1e6, 2e6, 1, 0, 1, 1, is_filter=False)
+# # xfine = np.linspace(0, np.pi, 100)
+# # yfine = list(np.sin(xfine))
+# # client.from_memory(0, 0, RamParameterType.AMPLITUDE, yfine,
+# #     1e6, 1, 0, 50e-6, ramp_filter=OutputType.PHASE)
+#
+#
+# xfine = np.linspace(1e6, 2e6, 100)
+# yfine = list(xfine)
+# client.from_memory(0, 0, RamParameterType.FREQUENCY, yfine,
+#     1e6, 1, 0, 50e-6, ramp_filter=OutputType.AMPLITUDE)
+#
+# client.run(0)
