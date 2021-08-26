@@ -6,17 +6,6 @@ from enum import Enum
 
 import numpy as np
 
-def push_or_pop(list_to_check, value, action_on_pop):
-    """ This function checks `list_to_check` if it contains `value`.
-    If not, it inserts the value. If it does exist, it is removed and
-    action_on_pop(value) is run"""
-
-    if value in list_to_check:
-        list_to_check.remove(value)
-        action_on_pop(value)
-    else:
-        list_to_check.append(value)
-
 class TriggerEvent(Enum):
     NONE                    = 0   # No event
     ALL_SPI_FIFOS_FLUSHED   = 2   # SPI FIFO into AD9910 empty on both channels
@@ -346,7 +335,7 @@ class WieserlabsClient:
         to a preferred value and note down the peak amplitude. This is the value given into max_amp in dBm.
         """
         logging.root.level = loglevel
-        
+
         self.ip_address = ip_address
         self.max_amp = max_amp
 
@@ -520,13 +509,6 @@ class WieserlabsClient:
             return -1
 
         slot = self.slots[slot_index]
-
-        # If we are sending a register message, we need to check if we have to update first.
-        # if isinstance(msg, DCPRegisterWriteMessage) or isinstance(msg, AD9910RegisterWriteMessage):
-        #     push_or_pop(slot._update_queue[msg.channel],
-        #                 msg.register_name,
-        #                 lambda _: slot.message_stack.append(UpdateMessage(msg.channel, "u")))
-
         slot.message_stack.append(msg)
 
     def reset(self, slot_index, channel=None):
